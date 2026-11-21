@@ -67,31 +67,34 @@ jobs:
       - name: Compile AERA Recovery
         run: |
           cd ~/aera-workdir
-          set +e
           source build/envsetup.sh
           export ALLOW_MISSING_DEPENDENCIES=true
-          lunch twrp_tulip-eng
-          set -e
+          echo "=== Executing Android 16 bp2a Lunch Combo ==="
+          lunch twrp_tulip-bp2a-eng || lunch aera_tulip-bp2a-eng || lunch twrp_tulip-eng
           mka adbd recoveryimage -j$(nproc --all)
 
       - name: Validate Recovery Image
         id: check_image
         run: |
-          IMG_PATH="$HOME/aera-workdir/out/target/product/tulip/recovery.img"
-          if [ ! -f "$IMG_PATH" ]; then
-            echo "::error::recovery.img was not generated!"
+          OUT_DIR="$HOME/aera-workdir/out/target/product/tulip"
+          echo "Inspecting output directory: $OUT_DIR"
+          ls -lh "$OUT_DIR" || true
+
+          IMG_PATH=$(find "$OUT_DIR" -maxdepth 1 -type f \( -name 'AERA-*.img' -o -name 'recovery.img' \) | head -n 1)
+          if [ -z "$IMG_PATH" ] || [ ! -f "$IMG_PATH" ]; then
+            echo "::error::Recovery image was not generated!"
             exit 1
           fi
 
           SIZE=$(stat -c%s "$IMG_PATH")
-          echo "Built recovery.img size: $SIZE bytes"
+          echo "Built recovery image: $IMG_PATH ($SIZE bytes)"
           # Tulip recovery partition is exactly 64MB (67108864 bytes)
           if [ "$SIZE" -gt 67108864 ]; then
             echo "::error::Recovery image exceeds the tulip 64MB partition limit ($SIZE > 67108864)!"
             exit 1
           fi
 
-          echo "Recovery image is verified and within partition limits."
+          echo "Recovery image verified and within partition limits."
           echo "IMG_PATH=$IMG_PATH" >> $GITHUB_ENV
           echo "IMG_SIZE=$SIZE" >> $GITHUB_ENV
 
@@ -99,14 +102,18 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: AERA-Recovery-tulip-${{ github.run_number }}
-          path: ${{ env.IMG_PATH }}
+          path: |
+            ~/aera-workdir/out/target/product/tulip/AERA-R*.img
+            ~/aera-workdir/out/target/product/tulip/AERA-R*.zip
+            ~/aera-workdir/out/target/product/tulip/recovery.img
+          if-no-files-found: warn
           retention-days: 14
 
       - name: Create GitHub Release
         if: ${{ github.event_name == 'push' || inputs.publish_release }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: aera-tulip-${{ github.run_number }}
+          tag_name: aera-tulip-v${{ github.run_number }}
           name: AERA Recovery for Redmi Note 6 Pro (tulip) - Build #${{ github.run_number }}
           body: |
             ## AERA Recovery for Xiaomi Redmi Note 6 Pro (`tulip`)
@@ -127,4 +134,17 @@ jobs:
                fastboot flash recovery recovery.img
                fastboot reboot recovery
                ```
-          files: ${{ env.IMG_PATH }}
+          files: |
+            ~/aera-workdir/out/target/product/tulip/AERA-R*.img
+            ~/aera-workdir/out/target/product/tulip/AERA-R*.zip
+            ~/aera-workdir/out/target/product/tulip/recovery.img
+
+      - name: Upload Build Log on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: |
+            ~/aera-workdir/out/error.log
+            ~/aera-workdir/out/verbose.log.gz
+          if-no-files-found: ignore
