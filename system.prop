@@ -1,0 +1,10 @@
+#
+# System properties for Xiaomi Redmi Note 6 Pro (tulip)
+#
+ro.product.device=tulip
+ro.product.model=Redmi Note 6 Pro
+ro.product.brand=Xiaomi
+ro.product.manufacturer=Xiaomi
+ro.product.name=tulip
+ro.product.board=sdm660
+ro.board.platform=sdm660
