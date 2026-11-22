@@ -16,71 +16,122 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    name: Build AERA Recovery for tulip
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
 
     steps:
-      - name: Free Disk Space
-        uses: rokibhasansagar/slimhub_actions@main
+      - name: 1. Checkout Workflow Repo
+        uses: actions/checkout@v4
 
-      - name: Setup Swap Space
-        uses: pierotofy/set-swap-space@master
+      - name: 2. Maximize Build Space (Restructure Disk to ~120GB)
+        uses: easimon/maximize-build-space@master
         with:
-          swap-size-gb: 12
+          root-reserve-mb: 8192
+          temp-reserve-mb: 4096
+          swap-size-mb: 8192
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
 
-      - name: Install Build Dependencies
+      - name: 3. Verify Disk and Memory
         run: |
+          echo "=== Disk Layout ==="
+          df -h
+          echo "=== Memory & Swap ==="
+          free -h
+
+      - name: 4. Install Build Dependencies & Setup Repo
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update
           sudo apt-get install -y \
             git-core gnupg flex bison build-essential zip curl zlib1g-dev \
-            libc6-dev-i386 x11proto-core-dev libx11-dev lib32z1-dev \
-            libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
-            python3 python-is-python3 repo ccache rsync bc libncurses5-dev libssl-dev
+            libc6-dev-i386 libncurses5 lib32ncurses5-dev x11proto-core-dev libx11-dev \
+            lib32z1-dev libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
+            python3 python-is-python3 rsync lz4 bc ccache libssl-dev
 
-      - name: Setup Java 11
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'zulu'
-          java-version: '11'
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          sudo ln -sf ~/bin/repo /usr/bin/repo
 
-      - name: Checkout Device Tree
-        uses: actions/checkout@v4
-        with:
-          path: device_tree
-
-      - name: Initialize and Sync AERA Manifest
-        run: |
-          mkdir -p ~/aera-workdir
-          cd ~/aera-workdir
           git config --global user.name "shivrajtode"
           git config --global user.email "todeshivraj@gmail.com"
+          git config --global url."https://github.com/".insteadOf "ssh://git@github.com/"
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - name: 5. Init & Shallow Sync AERA 16.0 Source
+        run: |
+          # Use GITHUB_WORKSPACE (mounted on the massive ~120GB partition)
+          WORKDIR="${GITHUB_WORKSPACE}/aera_workdir"
+          mkdir -p "${WORKDIR}"
+          cd "${WORKDIR}"
+
+          echo "=== Initializing AERA Manifest ==="
           repo init --depth=1 -u https://github.com/AERA-Recovery/android_manifest.git -b aera-16.0
-          repo sync -c --force-sync --no-clone-bundle --no-tags -j$(nproc)
 
-      - name: Inject Device Tree
-        run: |
-          mkdir -p ~/aera-workdir/device/xiaomi/tulip
-          cp -r $GITHUB_WORKSPACE/device_tree/* ~/aera-workdir/device/xiaomi/tulip/
-          ls -la ~/aera-workdir/device/xiaomi/tulip
+          # Ensure all ssh urls are replaced with https
+          find .repo/manifests -name "*.xml" -exec sed -i 's|ssh://git@github.com/|https://github.com/|g' {} + || true
 
-      - name: Compile AERA Recovery
+          echo "=== Shallow Syncing AERA Source ==="
+          repo sync -c --no-clone-bundle --no-tags --optimized-fetch --prune -j$(nproc --all) || repo sync -c -j4
+
+      - name: 6. Inject Device Tree
         run: |
-          cd ~/aera-workdir
+          WORKDIR="${GITHUB_WORKSPACE}/aera_workdir"
+          TARGET_DIR="${WORKDIR}/device/xiaomi/tulip"
+          mkdir -p "${TARGET_DIR}"
+          # Copy our repository files into device/xiaomi/tulip
+          rsync -av --exclude='.git' --exclude='aera_workdir' "${GITHUB_WORKSPACE}/" "${TARGET_DIR}/"
+          ls -la "${TARGET_DIR}"
+
+      - name: 7. Space Saver: Erase .repo Directory (~25GB Free Space)
+        run: |
+          WORKDIR="${GITHUB_WORKSPACE}/aera_workdir"
+          cd "${WORKDIR}"
+          echo "=== Disk Before Removing .repo ==="
+          df -h "${WORKDIR}"
+
+          echo "Deleting .repo to reclaim ~25GB of storage..."
+          rm -rf .repo
+
+          echo "=== Disk After Removing .repo ==="
+          df -h "${WORKDIR}"
+
+      - name: 8. Compile AERA Recovery
+        env:
+          # Soong memory limits to prevent OOM
+          GOGC: "50"
+          GOMEMLIMIT: "12GiB"
+          ALLOW_MISSING_DEPENDENCIES: "true"
+        run: |
+          WORKDIR="${GITHUB_WORKSPACE}/aera_workdir"
+          cd "${WORKDIR}"
           source build/envsetup.sh
-          export ALLOW_MISSING_DEPENDENCIES=true
-          echo "=== Executing Android 16 bp2a Lunch Combo ==="
+
+          echo "=== Loading Lunch Target ==="
           lunch twrp_tulip-bp2a-eng || lunch aera_tulip-bp2a-eng || lunch twrp_tulip-eng
-          mka adbd recoveryimage -j$(nproc --all)
 
-      - name: Validate Recovery Image
-        id: check_image
+          echo "=== Building Recovery Image ==="
+          if command -v mka >/dev/null 2>&1; then
+            mka recoveryimage -j$(nproc --all)
+          else
+            m recoveryimage -j$(nproc --all)
+          fi
+
+      - name: 9. Validate Recovery Output
+        id: validate
         run: |
-          OUT_DIR="$HOME/aera-workdir/out/target/product/tulip"
-          echo "Inspecting output directory: $OUT_DIR"
-          ls -lh "$OUT_DIR" || true
+          WORKDIR="${GITHUB_WORKSPACE}/aera_workdir"
+          OUT_DIR="${WORKDIR}/out/target/product/tulip"
+          echo "Inspecting output directory:"
+          ls -lh "${OUT_DIR}" || true
 
-          IMG_PATH=$(find "$OUT_DIR" -maxdepth 1 -type f \( -name 'AERA-*.img' -o -name 'recovery.img' \) | head -n 1)
+          IMG_PATH=$(find "${OUT_DIR}" -maxdepth 1 -type f \( -name 'AERA-*.img' -o -name 'recovery.img' \) | head -n 1)
           if [ -z "$IMG_PATH" ] || [ ! -f "$IMG_PATH" ]; then
             echo "::error::Recovery image was not generated!"
             exit 1
@@ -88,9 +139,9 @@ jobs:
 
           SIZE=$(stat -c%s "$IMG_PATH")
           echo "Built recovery image: $IMG_PATH ($SIZE bytes)"
-          # Tulip recovery partition is exactly 64MB (67108864 bytes)
+          # Tulip recovery partition size is strictly 64MB (67108864 bytes)
           if [ "$SIZE" -gt 67108864 ]; then
-            echo "::error::Recovery image exceeds the tulip 64MB partition limit ($SIZE > 67108864)!"
+            echo "::error::Recovery image exceeds tulip 64MB partition limit ($SIZE > 67108864)!"
             exit 1
           fi
 
@@ -98,18 +149,20 @@ jobs:
           echo "IMG_PATH=$IMG_PATH" >> $GITHUB_ENV
           echo "IMG_SIZE=$SIZE" >> $GITHUB_ENV
 
-      - name: Upload Artifact
+          # Gather outputs for release
+          mkdir -p "${GITHUB_WORKSPACE}/artifacts"
+          find "${OUT_DIR}" -maxdepth 1 -type f \( -name "*.img" -o -name "*.zip" \) -exec cp {} "${GITHUB_WORKSPACE}/artifacts/" \;
+          ls -lh "${GITHUB_WORKSPACE}/artifacts/"
+
+      - name: 10. Upload Recovery Artifact
         uses: actions/upload-artifact@v4
         with:
           name: AERA-Recovery-tulip-${{ github.run_number }}
-          path: |
-            ~/aera-workdir/out/target/product/tulip/AERA-R*.img
-            ~/aera-workdir/out/target/product/tulip/AERA-R*.zip
-            ~/aera-workdir/out/target/product/tulip/recovery.img
+          path: ${{ github.workspace }}/artifacts/*
           if-no-files-found: warn
           retention-days: 14
 
-      - name: Create GitHub Release
+      - name: 11. Create GitHub Release
         if: ${{ github.event_name == 'push' || inputs.publish_release }}
         uses: softprops/action-gh-release@v2
         with:
@@ -134,17 +187,14 @@ jobs:
                fastboot flash recovery recovery.img
                fastboot reboot recovery
                ```
-          files: |
-            ~/aera-workdir/out/target/product/tulip/AERA-R*.img
-            ~/aera-workdir/out/target/product/tulip/AERA-R*.zip
-            ~/aera-workdir/out/target/product/tulip/recovery.img
+          files: ${{ github.workspace }}/artifacts/*
 
-      - name: Upload Build Log on Failure
+      - name: 12. Upload Build Log on Failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: build-log-${{ github.run_number }}
           path: |
-            ~/aera-workdir/out/error.log
-            ~/aera-workdir/out/verbose.log.gz
+            ${{ github.workspace }}/aera_workdir/out/error.log
+            ${{ github.workspace }}/aera_workdir/out/verbose.log.gz
           if-no-files-found: ignore
