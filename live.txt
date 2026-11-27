@@ -1,0 +1,24 @@
+Fri Nov 27 04:30:59 UTC 2026
+ 04:30:59 up 26 min,  0 users,  load average: 4.34, 2.85, 1.86
+               total        used        free      shared  buff/cache   available
+Mem:           15988         499         423          27       15065       15109
+Swap:           6143         155        5988
+/dev/mapper/buildvg-buildlv   95G   77G   19G  81% /home/runner/work/android_device_xiaomi_tulip-AERA/android_device_xiaomi_tulip-AERA
+--- top processes by RSS ---
+    PID   RSS %CPU     ELAPSED COMMAND
+   1663 103804 0.6       26:18 /tmp/provjobd3995225904
+   1884 65920  0.3       16:50 /home/runner/actions-runner/cached/2.338.2/bin/Runner.Worker spawnclient 142 145
+   1864 52292  0.1       16:51 /home/runner/actions-runner/cached/2.338.2/bin/Runner.Listener run
+    201 44256  0.0       26:25 /sbin/multipathd -d -s
+    639 24104  0.0       26:20 /usr/lib/snapd/snapd
+    770 20792  0.0       26:20 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+   1295 20200  0.0       26:19 /usr/bin/python3 -u bin/WALinuxAgent-2.16.0.2-py3.12.egg -run-exthandlers
+--- earlyoom ---
+earlyoom v1.6.2
+Preferring to kill process names that match regex '(soong_build|ckati|ninja|clang|lld|go)'
+mem total: 15988 MiB, swap total: 6143 MiB
+sending SIGTERM when mem <=  5.00% and swap <= 50.00%,
+        SIGKILL when mem <=  2.50% and swap <= 25.00%
+mem avail: 15121 of 15988 MiB (94.57%), swap free: 5988 of 6143 MiB (97.47%)
+--- kernel oom ---
+--- resources.log (last 15) ---
