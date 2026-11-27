@@ -29,7 +29,7 @@ jobs:
         with:
           root-reserve-mb: 10240
           temp-reserve-mb: 2048
-          swap-size-mb: 10240
+          swap-size-mb: 6144
           remove-dotnet: 'true'
           remove-android: 'true'
           remove-haskell: 'true'
@@ -57,7 +57,7 @@ jobs:
             libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
             python3 python-is-python3 rsync lz4 bc libssl-dev ccache
           # optional extras, never fatal
-          for p in libncurses5 lib32ncurses-dev; do
+          for p in libncurses5 lib32ncurses-dev earlyoom; do
             sudo apt-get install -y "$p" || echo "optional package $p not available"
           done
 
@@ -95,11 +95,52 @@ jobs:
         env:
           ALLOW_MISSING_DEPENDENCIES: "true"
           GOGC: "50"
-          GOMEMLIMIT: "10GiB"
+          GOMEMLIMIT: "8GiB"
           LC_ALL: C
+          GH_TOKEN: ${{ github.token }}
+          REPO_SLUG: ${{ github.repository }}
         run: |
           cd "$GITHUB_WORKSPACE/aera"
-          # resource watchdog: one line per minute, helps to see OOM / disk trends
+          : > "$GITHUB_WORKSPACE/build.log"
+
+          # --- protect the runner agent, make the build the preferred OOM victim ---
+          for p in $(pgrep -f 'Runner.Listener|Runner.Worker'); do
+            echo -900 | sudo tee /proc/$p/oom_score_adj >/dev/null || true
+          done
+          echo 800 > /proc/$$/oom_score_adj || true
+          sudo sysctl -w vm.swappiness=10 >/dev/null || true
+          if command -v earlyoom >/dev/null 2>&1; then
+            sudo systemctl stop earlyoom 2>/dev/null || true
+            sudo nohup earlyoom -m 5 -s 50 -r 60 --prefer '(soong_build|ckati|ninja|clang|lld|go)' > "$GITHUB_WORKSPACE/earlyoom.log" 2>&1 &
+          fi
+
+          # --- live diagnostics: push a small snapshot to ci-logs every 2 min (survives a dying runner) ---
+          cat > "$RUNNER_TEMP/pusher.sh" <<'PUSHER'
+          #!/bin/bash
+          D="$RUNNER_TEMP/livelog"; rm -rf "$D"; mkdir -p "$D"; cd "$D"
+          git init -q -b ci-logs
+          git config user.name ci; git config user.email ci@users.noreply.github.com
+          while true; do
+            {
+              date -u; uptime; free -m
+              df -h "$GITHUB_WORKSPACE" | tail -1
+              echo "--- top processes by RSS ---"
+              ps -eo pid,rss,pcpu,etime,args --sort=-rss | head -8 | cut -c1-180
+              echo "--- earlyoom ---"; tail -n 12 "$GITHUB_WORKSPACE/earlyoom.log" 2>/dev/null
+              echo "--- kernel oom ---"; sudo dmesg 2>/dev/null | grep -i -E "out of memory|killed process|oom" | tail -5
+              echo "--- resources.log (last 15) ---"; tail -n 15 "$GITHUB_WORKSPACE/resources.log" 2>/dev/null
+            } > live.txt 2>&1
+            tail -n 60 "$GITHUB_WORKSPACE/build.log" > build-live.log 2>/dev/null
+            sed -i 's#x-access-token:[^@]*@#x-access-token:***@#g' live.txt build-live.log
+            git add -A; git commit -q --allow-empty -m "live $(date +%T)"
+            git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${REPO_SLUG}.git" HEAD:ci-logs >/dev/null 2>&1
+            sleep 120
+          done
+          PUSHER
+          chmod +x "$RUNNER_TEMP/pusher.sh"
+          nohup "$RUNNER_TEMP/pusher.sh" >/dev/null 2>&1 &
+
+          # resource watchdog: one line per minute
           ( while sleep 60; do
               echo "$(date +%T) mem_used=$(free -m | awk '/Mem/{print $3}')MB swap_used=$(free -m | awk '/Swap/{print $3}')MB disk_free=$(df -h --output=avail "$GITHUB_WORKSPACE" | tail -1 | tr -d ' ')"
             done >> "$GITHUB_WORKSPACE/resources.log" ) &
@@ -113,7 +154,10 @@ jobs:
           test -n "$TARGET_PRODUCT"
 
           set -o pipefail
-          mka adbd recoveryimage -j3 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          echo "=== PHASE 1: analysis only (m nothing) ===" | tee -a "$GITHUB_WORKSPACE/build.log"
+          m nothing 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+          echo "=== PHASE 2: adbd + recoveryimage ===" | tee -a "$GITHUB_WORKSPACE/build.log"
+          mka adbd recoveryimage -j3 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
 
       - name: 8. Validate recovery output
         run: |
@@ -172,12 +216,14 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
+          pkill -f pusher.sh || true
           D="$RUNNER_TEMP/ci"; rm -rf "$D"; mkdir -p "$D"
           {
             echo "run=${{ github.run_number }} commit=${{ github.sha }} job_status=${{ job.status }}"
             echo "--- resources (last 60) ---"; tail -n 60 "$GITHUB_WORKSPACE/resources.log" 2>/dev/null
             echo "--- df ---"; df -h
             echo "--- free ---"; free -m
+            echo "--- earlyoom ---"; tail -n 30 "$GITHUB_WORKSPACE/earlyoom.log" 2>/dev/null
             echo "--- out dir ---"; ls -lh "$GITHUB_WORKSPACE/aera/out/target/product/tulip" 2>/dev/null | head -60
           } > "$D/summary.txt"
           if [ -f "$GITHUB_WORKSPACE/build.log" ]; then
