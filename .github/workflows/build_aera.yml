@@ -29,7 +29,7 @@ jobs:
         with:
           root-reserve-mb: 10240
           temp-reserve-mb: 2048
-          swap-size-mb: 6144
+          swap-size-mb: 1024
           remove-dotnet: 'true'
           remove-android: 'true'
           remove-haskell: 'true'
@@ -41,125 +41,146 @@ jobs:
         with:
           path: device_tree
 
-      - name: 3. Verify disk and memory
+      - name: 3. Prepare (deps, repo sync, inject device tree)
         run: |
-          df -h
-          free -h
-          nproc
-
-      - name: 4. Install build dependencies and repo
-        run: |
+          # Prep: build deps + repo + AERA 16.0 sync + inject the tulip device tree.
+          set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
-          sudo apt-get update
-          sudo apt-get install -y \
+          W="${GITHUB_WORKSPACE:?}"
+
+          echo "== disk / mem / cpu =="; df -h / "$W"; free -m; nproc
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
             git-core gnupg flex bison build-essential zip curl zlib1g-dev \
             libc6-dev-i386 x11proto-core-dev libx11-dev lib32z1-dev \
             libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
-            python3 python-is-python3 rsync lz4 bc libssl-dev ccache
-          # optional extras, never fatal
+            python3 python-is-python3 rsync lz4 bc libssl-dev
           for p in libncurses5 lib32ncurses-dev earlyoom; do
-            sudo apt-get install -y "$p" || echo "optional package $p not available"
+            sudo apt-get install -y -qq "$p" || echo "optional package $p not available"
           done
 
           mkdir -p ~/bin
           curl -sL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
           chmod a+x ~/bin/repo
           sudo ln -sf ~/bin/repo /usr/local/bin/repo
-
           git config --global user.name "shivrajtode"
           git config --global user.email "todeshivraj@gmail.com"
           git config --global color.ui false
 
-      - name: 5. Init and sync AERA 16.0 source
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/aera"
-          cd "$GITHUB_WORKSPACE/aera"
+          mkdir -p "$W/aera"
+          cd "$W/aera"
           repo init --depth=1 -u https://github.com/AERA-Recovery/android_manifest.git -b aera-16.0
           for i in 1 2 3; do
             repo sync -c --force-sync --no-clone-bundle --no-tags --optimized-fetch --prune -j"$(nproc --all)" && break
-            echo "repo sync failed (attempt $i), retrying..."
-            sleep 20
+            echo "repo sync failed (attempt $i), retrying..."; sleep 20
           done
           test -f build/envsetup.sh
-          df -h "$GITHUB_WORKSPACE"
 
-      - name: 6. Inject device tree
-        run: |
-          T="$GITHUB_WORKSPACE/aera/device/xiaomi/tulip"
+          T="$W/aera/device/xiaomi/tulip"
           mkdir -p "$T"
-          rsync -a --exclude='.git' --exclude='.github' "$GITHUB_WORKSPACE/device_tree/" "$T/"
-          ls -la "$T"
-          ls -la "$T/prebuilt"
+          rsync -a --exclude='.git' --exclude='.github' "$W/device_tree/" "$T/"
+          ls -la "$T" "$T/prebuilt"
 
-      - name: 7. Compile AERA recovery
+          echo "== disk after sync =="; df -h "$W"
+          echo "== biggest top-level dirs =="; du -sh --max-depth=1 "$W/aera" 2>/dev/null | sort -h | tail -15
+
+      - name: 4. Build AERA recovery
         env:
-          ALLOW_MISSING_DEPENDENCIES: "true"
-          GOGC: "50"
-          GOMEMLIMIT: "8GiB"
-          LC_ALL: C
           GH_TOKEN: ${{ github.token }}
           REPO_SLUG: ${{ github.repository }}
         run: |
-          cd "$GITHUB_WORKSPACE/aera"
-          : > "$GITHUB_WORKSPACE/build.log"
-
-          # --- protect the runner agent, make the build the preferred OOM victim ---
-          for p in $(pgrep -f 'Runner.Listener|Runner.Worker'); do
-            echo -900 | sudo tee /proc/$p/oom_score_adj >/dev/null || true
-          done
-          echo 800 > /proc/$$/oom_score_adj || true
-          sudo sysctl -w vm.swappiness=10 >/dev/null || true
-          if command -v earlyoom >/dev/null 2>&1; then
-            sudo systemctl stop earlyoom 2>/dev/null || true
-            sudo nohup earlyoom -m 5 -s 50 -r 60 --prefer '(soong_build|ckati|ninja|clang|lld|go)' > "$GITHUB_WORKSPACE/earlyoom.log" 2>&1 &
-          fi
-
-          # --- live diagnostics: push a small snapshot to ci-logs every 2 min (survives a dying runner) ---
-          cat > "$RUNNER_TEMP/pusher.sh" <<'PUSHER'
-          #!/bin/bash
-          D="$RUNNER_TEMP/livelog"; rm -rf "$D"; mkdir -p "$D"; cd "$D"
+          set +e
+          cat > "$RUNNER_TEMP/pusher.sh" <<'PUSHER_EOF'
+          # Live diagnostics: ring buffer of 12 snapshots (every 10 s) pushed to the ci-logs branch.
+          D="${RUNNER_TEMP:-/tmp}/livelog"; rm -rf "$D"; mkdir -p "$D"; cd "$D" || exit 1
           git init -q -b ci-logs
           git config user.name ci; git config user.email ci@users.noreply.github.com
+          URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO_SLUG}.git"
+          CG=/sys/fs/cgroup/aerabuild
+          n=0
           while true; do
+            i=$(printf '%02d' $((n % 12)))
             {
-              date -u; uptime; free -m
-              df -h "$GITHUB_WORKSPACE" | tail -1
-              echo "--- top processes by RSS ---"
-              ps -eo pid,rss,pcpu,etime,args --sort=-rss | head -8 | cut -c1-180
-              echo "--- earlyoom ---"; tail -n 12 "$GITHUB_WORKSPACE/earlyoom.log" 2>/dev/null
-              echo "--- kernel oom ---"; sudo dmesg 2>/dev/null | grep -i -E "out of memory|killed process|oom" | tail -5
-              echo "--- resources.log (last 15) ---"; tail -n 15 "$GITHUB_WORKSPACE/resources.log" 2>/dev/null
-            } > live.txt 2>&1
-            tail -n 60 "$GITHUB_WORKSPACE/build.log" > build-live.log 2>/dev/null
-            sed -i 's#x-access-token:[^@]*@#x-access-token:***@#g' live.txt build-live.log
-            git add -A; git commit -q --allow-empty -m "live $(date +%T)"
-            git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${REPO_SLUG}.git" HEAD:ci-logs >/dev/null 2>&1
-            sleep 120
+              echo "### $(date -u +%T) snap=$n"; uptime
+              for f in memory io cpu; do echo "PSI $f: $(head -1 /proc/pressure/$f 2>/dev/null)"; done
+              free -m | sed -n '1,3p'
+              df -h / "$W" 2>/dev/null | tail -n 2
+              echo "procs=$(find /proc -maxdepth 1 -name '[0-9]*' | wc -l)"
+              if [ -d "$CG" ]; then
+                echo "cgroup: cur=$(cat $CG/memory.current 2>/dev/null) peak=$(cat $CG/memory.peak 2>/dev/null) max=$(cat $CG/memory.max 2>/dev/null) events=$(tr '\n' ' ' < $CG/memory.events 2>/dev/null)"
+              fi
+              ps -eo pid,rss,pcpu,stat,etime,args --sort=-rss | head -7 | cut -c1-150
+              echo "-- dmesg --"; dmesg 2>/dev/null | tail -n 6 | cut -c1-200
+            } > "snap-$i.txt" 2>&1
+            cp "snap-$i.txt" latest.txt
+            tail -n 40 "$LOG" > build-live.log 2>/dev/null
+            sed -i 's#x-access-token:[^@]*@#x-access-token:***@#g' snap-*.txt latest.txt build-live.log 2>/dev/null
+            git add -A; git commit -q --allow-empty -m "snap $n"
+            git push -q -f "$URL" HEAD:ci-logs >/dev/null 2>&1
+            n=$((n+1)); sleep 10
           done
-          PUSHER
+          PUSHER_EOF
           chmod +x "$RUNNER_TEMP/pusher.sh"
-          nohup "$RUNNER_TEMP/pusher.sh" >/dev/null 2>&1 &
 
-          # resource watchdog: one line per minute
-          ( while sleep 60; do
-              echo "$(date +%T) mem_used=$(free -m | awk '/Mem/{print $3}')MB swap_used=$(free -m | awk '/Swap/{print $3}')MB disk_free=$(df -h --output=avail "$GITHUB_WORKSPACE" | tail -1 | tr -d ' ')"
-            done >> "$GITHUB_WORKSPACE/resources.log" ) &
-
-          set +e
-          source build/envsetup.sh
-          lunch twrp_tulip-bp2a-eng || lunch twrp_tulip-eng
-          LUNCH_RC=$?
-          set -e
-          echo "lunch rc=$LUNCH_RC  TARGET_PRODUCT=$TARGET_PRODUCT"
-          test -n "$TARGET_PRODUCT"
-
+          # Build driver: OOM protection, live diagnostics, memory-capped analysis + build.
           set -o pipefail
-          echo "=== PHASE 1: analysis only (m nothing) ===" | tee -a "$GITHUB_WORKSPACE/build.log"
-          m nothing 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
-          echo "=== PHASE 2: adbd + recoveryimage ===" | tee -a "$GITHUB_WORKSPACE/build.log"
-          mka adbd recoveryimage -j3 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+          W="${GITHUB_WORKSPACE:?}"
+          LOG="$W/build.log"; : > "$LOG"
+          export W LOG
+          say() { echo "[ci $(date +%T)] $*" | tee -a "$LOG"; }
+          cd "$W/aera" || exit 1
 
-      - name: 8. Validate recovery output
+          # 1) protect the runner agent from the OOM killer
+          for p in $(pgrep -f 'Runner.Listener|Runner.Worker'); do
+            echo -900 | sudo tee "/proc/$p/oom_score_adj" >/dev/null 2>&1 || true
+          done
+          sudo sysctl -w vm.swappiness=10 >/dev/null 2>&1 || true
+
+          # 2) live diagnostics (started BEFORE the memory cap so it stays outside it)
+          if [ -n "${GH_TOKEN:-}" ]; then
+            export GH_TOKEN REPO_SLUG
+            sudo -E nice -n -15 bash "$RUNNER_TEMP/pusher.sh" >/dev/null 2>&1 &
+          fi
+
+          # 3) hard memory cap for the build tree (cgroup v2): a runaway gets OOM-killed, the VM survives
+          CG=/sys/fs/cgroup/aerabuild
+          if [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = "cgroup2fs" ]; then
+            sudo mkdir -p "$CG" 2>/dev/null
+            echo "+memory" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null 2>&1 || true
+            echo 0 | sudo tee "$CG/memory.swap.max" >/dev/null 2>&1 || true
+            if echo "${CI_MEM_MAX:-14G}" | sudo tee "$CG/memory.max" >/dev/null 2>&1 \
+               && echo $$ | sudo tee "$CG/cgroup.procs" >/dev/null 2>&1; then
+              say "cgroup memory cap active: max=$(cat $CG/memory.max)"
+            else
+              say "WARNING: could not apply the cgroup memory cap"
+            fi
+          else
+            say "WARNING: cgroup v2 not available"
+          fi
+          peak() { cat "$CG/memory.peak" 2>/dev/null || echo n/a; }
+          events() { tr '\n' ' ' < "$CG/memory.events" 2>/dev/null; }
+
+          say "disk before build:"; df -h "$W" | tee -a "$LOG"
+
+          export ALLOW_MISSING_DEPENDENCIES=true LC_ALL=C GOGC=50 GOMEMLIMIT=10GiB GOMAXPROCS=3
+
+          source build/envsetup.sh >>"$LOG" 2>&1
+          lunch twrp_tulip-bp2a-eng >>"$LOG" 2>&1 || lunch twrp_tulip-eng >>"$LOG" 2>&1
+          if [ -z "${TARGET_PRODUCT:-}" ]; then say "lunch failed"; tail -n 40 "$LOG"; exit 1; fi
+          say "lunch ok: TARGET_PRODUCT=$TARGET_PRODUCT"
+
+          say "=== PHASE 1: analysis only (m nothing) ==="
+          m nothing 2>&1 | tee -a "$LOG"; RC=${PIPESTATUS[0]}
+          say "phase1 rc=$RC cgroup_peak=$(peak) events=$(events)"
+          [ "$RC" -eq 0 ] || exit "$RC"
+
+          say "=== PHASE 2: adbd + recoveryimage ==="
+          mka adbd recoveryimage -j3 2>&1 | tee -a "$LOG"; RC=${PIPESTATUS[0]}
+          say "phase2 rc=$RC cgroup_peak=$(peak) events=$(events)"
+          exit "$RC"
+
+      - name: 5. Validate recovery output
         run: |
           OUT="$GITHUB_WORKSPACE/aera/out/target/product/tulip"
           ls -lh "$OUT" || true
@@ -181,7 +202,7 @@ jobs:
           echo "IMG_SIZE=$SIZE" >> "$GITHUB_ENV"
           ls -lh "$GITHUB_WORKSPACE/artifacts"
 
-      - name: 9. Upload recovery artifact
+      - name: 6. Upload recovery artifact
         uses: actions/upload-artifact@v4
         with:
           name: AERA-Recovery-tulip-${{ github.run_number }}
@@ -189,7 +210,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: 10. Create GitHub release
+      - name: 7. Create GitHub release
         if: ${{ github.event_name == 'push' || inputs.publish_release }}
         uses: softprops/action-gh-release@v2
         with:
@@ -211,29 +232,32 @@ jobs:
             ```
           files: ${{ github.workspace }}/artifacts/*
 
-      # Pushes a small diagnostics bundle to the ci-logs branch so failures can be read without logging in.
-      - name: 11. Publish diagnostics to ci-logs branch
+      # Final diagnostics bundle on the ci-logs branch (live snapshots are pushed every 10 s while building).
+      - name: 8. Publish final diagnostics to ci-logs branch
         if: always()
         continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO_SLUG: ${{ github.repository }}
         run: |
-          pkill -f pusher.sh || true
-          D="$RUNNER_TEMP/ci"; rm -rf "$D"; mkdir -p "$D"
-          {
-            echo "run=${{ github.run_number }} commit=${{ github.sha }} job_status=${{ job.status }}"
-            echo "--- resources (last 60) ---"; tail -n 60 "$GITHUB_WORKSPACE/resources.log" 2>/dev/null
-            echo "--- df ---"; df -h
-            echo "--- free ---"; free -m
-            echo "--- earlyoom ---"; tail -n 30 "$GITHUB_WORKSPACE/earlyoom.log" 2>/dev/null
-            echo "--- out dir ---"; ls -lh "$GITHUB_WORKSPACE/aera/out/target/product/tulip" 2>/dev/null | head -60
-          } > "$D/summary.txt"
-          if [ -f "$GITHUB_WORKSPACE/build.log" ]; then
-            tail -n 300 "$GITHUB_WORKSPACE/build.log" > "$D/build-tail.log"
-            grep -n -E "error:|FAILED:|Error [0-9]+|fatal|undefined reference|No rule to make|too large|ERROR|ninja: " "$GITHUB_WORKSPACE/build.log" | head -120 > "$D/errors.txt" || true
+          sudo pkill -f pusher.sh || true
+          D="$RUNNER_TEMP/ci-final"; rm -rf "$D"
+          URL="https://x-access-token:${GH_TOKEN}@github.com/${REPO_SLUG}.git"
+          if ! git clone -q --depth 1 -b ci-logs "$URL" "$D" 2>/dev/null; then
+            mkdir -p "$D"; git -C "$D" init -q -b ci-logs
           fi
-          [ -f "$GITHUB_WORKSPACE/aera/out/error.log" ] && head -c 60000 "$GITHUB_WORKSPACE/aera/out/error.log" > "$D/soong-error.log"
           cd "$D"
-          git init -q -b ci-logs
-          git config user.name "ci"; git config user.email "ci@users.noreply.github.com"
+          {
+            echo "run=${{ github.run_number }} commit=${{ github.sha }} status=${{ job.status }}"
+            df -h; free -m
+            ls -lh "$GITHUB_WORKSPACE/aera/out/target/product/tulip" 2>/dev/null | head -60
+          } > final-summary.txt
+          if [ -f "$GITHUB_WORKSPACE/build.log" ]; then
+            tail -n 300 "$GITHUB_WORKSPACE/build.log" > final-build-tail.log
+            grep -n -E "error:|FAILED:|Error [0-9]+|fatal|undefined reference|No rule to make|too large|ERROR|ninja: |Killed" "$GITHUB_WORKSPACE/build.log" | head -120 > final-errors.txt || true
+          fi
+          [ -f "$GITHUB_WORKSPACE/aera/out/error.log" ] && head -c 60000 "$GITHUB_WORKSPACE/aera/out/error.log" > final-soong-error.log
+          git config user.name ci; git config user.email ci@users.noreply.github.com
           git add -A
-          git commit -q -m "diagnostics for run ${{ github.run_number }}"
-          git push -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" HEAD:ci-logs
+          git commit -q --allow-empty -m "final diagnostics run ${{ github.run_number }}"
+          git push -q -f "$URL" HEAD:ci-logs
